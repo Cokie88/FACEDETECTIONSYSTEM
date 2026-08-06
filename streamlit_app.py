@@ -29,8 +29,7 @@ MAJORS = [
     "Electronic Engineering",
     "Mechanical Engineering",
     "Electrical Power Engineering",
-    "Computer Engineering",
-    "Information Technology",
+    "Computer Engineering And Information Technology",
 ]
 SEMESTERS = [
     "Seminar","I","II","III","IV","V","VI",
