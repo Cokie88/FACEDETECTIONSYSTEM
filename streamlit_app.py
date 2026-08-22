@@ -1,3 +1,9 @@
+"""
+PTU Student Face Recognition System — Streamlit Version
+Fixed: use_container_width, image handling, camera capture,
+       face encoding consistency, training pipeline, error handling.
+"""
+
 import streamlit as st
 import sqlite3
 import os
@@ -6,12 +12,56 @@ import base64
 import io
 import logging
 import numpy as np
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 # ── Logging (visible in Streamlit Cloud logs) ────────────
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("PTU")
+
+# ══════════════════════════════════════════════════════════
+# FACE-ENGINE CAPABILITY DETECTION  (computed ONCE at import)
+# ──────────────────────────────────────────────────────────
+# Both cv2 and face_recognition are OPTIONAL, third-party, compiled
+# dependencies. Detect their availability a single time here so the
+# rest of the app never has to guess — and a missing dependency is
+# always reported as a distinct "engine unavailable" condition, never
+# silently mistaken for "no face found in a valid photo".
+# ══════════════════════════════════════════════════════════
+try:
+    import cv2  # noqa: F401
+    CV2_AVAILABLE = True
+    CV2_IMPORT_ERROR = None
+    CV2_VERSION = cv2.__version__
+except Exception as _cv2_exc:                       # pragma: no cover
+    CV2_AVAILABLE = False
+    CV2_IMPORT_ERROR = str(_cv2_exc)
+    CV2_VERSION = None
+    log.warning("cv2 (OpenCV) is not available: %s", CV2_IMPORT_ERROR)
+
+try:
+    import face_recognition  # noqa: F401
+    FACE_RECOGNITION_AVAILABLE = True
+    FACE_RECOGNITION_IMPORT_ERROR = None
+except Exception as _fr_exc:                         # pragma: no cover
+    FACE_RECOGNITION_AVAILABLE = False
+    FACE_RECOGNITION_IMPORT_ERROR = str(_fr_exc)
+    log.warning("face_recognition is not available: %s",
+                FACE_RECOGNITION_IMPORT_ERROR)
+
+FACE_ENGINE_AVAILABLE = CV2_AVAILABLE or FACE_RECOGNITION_AVAILABLE
+
+
+def face_engine_status() -> dict:
+    """Small diagnostics dict used by the UI / troubleshooting panel."""
+    return {
+        "cv2_available": CV2_AVAILABLE,
+        "cv2_version": CV2_VERSION,
+        "cv2_error": CV2_IMPORT_ERROR,
+        "face_recognition_available": FACE_RECOGNITION_AVAILABLE,
+        "face_recognition_error": FACE_RECOGNITION_IMPORT_ERROR,
+        "any_engine_available": FACE_ENGINE_AVAILABLE,
+    }
 
 # ── Page config ──────────────────────────────────────────
 st.set_page_config(
@@ -33,7 +83,8 @@ MAJORS = [
     "Electronic Engineering",
     "Mechanical Engineering",
     "Electrical Power Engineering",
-    "Computer Engineering & Information Technology",
+    "Computer Engineering",
+    "Information Technology",
 ]
 SEMESTERS = [
     "Seminar","I","II","III","IV","V","VI",
@@ -45,8 +96,44 @@ st.markdown("""
 <style>
 [data-testid="stAppViewContainer"]{background:#f8f9fa}
 [data-testid="stSidebar"]{background:linear-gradient(180deg,#1a1a2e,#16213e)}
-[data-testid="stSidebar"] *{color:#fff!important}
-[data-testid="stSidebar"] .stRadio label{color:#fff!important}
+[data-testid="stSidebar"] *{color:#f1f3f9!important}
+[data-testid="stSidebar"] .stRadio label{color:#f1f3f9!important}
+
+/* Section labels: "USER PANEL" / "ADMIN PANEL" — high-contrast, clearly visible */
+.ptu-sidebar-heading{
+  font-size:.72rem;font-weight:800;letter-spacing:1.5px;
+  text-transform:uppercase;color:#8fb3ff!important;opacity:1!important;
+  padding:.6rem .4rem .3rem;margin:0
+}
+
+/* Sidebar buttons: solid, readable in normal / hover / active states */
+[data-testid="stSidebar"] .stButton > button{
+  background:rgba(255,255,255,.07)!important;
+  color:#f1f3f9!important;
+  border:1px solid rgba(255,255,255,.16)!important;
+  border-radius:8px!important;
+  font-weight:600!important;
+  text-align:left!important;
+  justify-content:flex-start!important;
+  padding:.55rem .9rem!important;
+  transition:background .15s ease,border-color .15s ease,color .15s ease;
+}
+[data-testid="stSidebar"] .stButton > button:hover{
+  background:#0d6efd!important;
+  border-color:#0d6efd!important;
+  color:#ffffff!important;
+}
+[data-testid="stSidebar"] .stButton > button:focus:not(:active){
+  box-shadow:0 0 0 2px rgba(13,110,253,.5)!important;
+}
+[data-testid="stSidebar"] .stButton > button:active,
+[data-testid="stSidebar"] .stButton > button[kind="primary"]{
+  background:#0b5ed7!important;
+  border-color:#0b5ed7!important;
+  color:#ffffff!important;
+}
+/* Sidebar stat mini-cards / body text always stay legible */
+[data-testid="stSidebar"] small{color:#c7cee3!important}
 .ptu-card{background:#fff;border-radius:12px;padding:1.4rem;
           box-shadow:0 4px 12px rgba(0,0,0,.08);margin-bottom:1rem}
 .ptu-card-blue {border-left:4px solid #0d6efd}
@@ -117,8 +204,10 @@ def bytes_to_rgb_array(img_bytes: bytes):
     """
     try:
         pil_img = Image.open(io.BytesIO(img_bytes))
+        pil_img = ImageOps.exif_transpose(pil_img)  # fix phone-camera rotation
         pil_img = pil_img.convert("RGB")          # handles RGBA / L / P / CMYK
-        arr = np.array(pil_img, dtype=np.uint8)   # shape (H, W, 3)
+        arr = np.ascontiguousarray(
+            np.array(pil_img, dtype=np.uint8))    # shape (H, W, 3)
         if arr.ndim != 3 or arr.shape[2] != 3:
             return None, "Image conversion failed: unexpected shape."
         return arr, None
@@ -175,21 +264,28 @@ def display_image_from_bytes(img_bytes: bytes, caption: str = ""):
 ENCODING_DIM = 128
 ENCODING_METHOD_KEY = "encoding_method"   # stored in session_state
 
+# Sentinel error codes returned by encode_face(). The UI maps these to
+# specific, non-misleading messages instead of a generic "invalid image".
+ERR_NO_FACE           = "no_face"            # valid image, genuinely no face
+ERR_ENGINE_UNAVAILABLE = "engine_unavailable"  # cv2 AND face_recognition missing
+ERR_PROCESSING        = "processing_error"    # unexpected runtime error
+
+
 def _encode_face_recognition(arr: np.ndarray):
-    """face_recognition library path → 128-D vector."""
-    import face_recognition  # type: ignore
+    """face_recognition (dlib) path → 128-D vector. Assumes it's available."""
     encs = face_recognition.face_encodings(arr)
     if not encs:
-        return None, "no_face"
+        return None, ERR_NO_FACE
     return encs[0].astype(np.float64), None
+
 
 def _encode_opencv(arr: np.ndarray):
     """
-    OpenCV fallback path.
+    OpenCV Haar-cascade fallback path. Assumes cv2 is available.
     Returns a 128-D vector (downsampled+normalized grayscale patch)
-    so the shape matches face_recognition output.
+    so the shape matches face_recognition output. This is a lower
+    accuracy fallback used only when face_recognition/dlib can't run.
     """
-    import cv2
     gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
     fc   = cv2.CascadeClassifier(
                cv2.data.haarcascades +
@@ -197,9 +293,9 @@ def _encode_opencv(arr: np.ndarray):
     faces = fc.detectMultiScale(
         gray, scaleFactor=1.1, minNeighbors=5, minSize=(48, 48))
     if len(faces) == 0:
-        return None, "no_face"
+        return None, ERR_NO_FACE
     # Use largest detected face
-    areas = [w*h for (x,y,w,h) in faces]
+    areas = [w*h for (x, y, w, h) in faces]
     x, y, w, h = faces[int(np.argmax(areas))]
     roi  = gray[y:y+h, x:x+w]
     # Resize to 16×8 = 128 pixels (same final dim as face_recognition)
@@ -208,35 +304,67 @@ def _encode_opencv(arr: np.ndarray):
     norm  = np.linalg.norm(flat)
     return (flat / norm if norm > 0 else flat), None
 
+
 def encode_face(arr: np.ndarray):
     """
-    Returns (encoding: np.ndarray[128], method: str, error: str|None).
-    error is None on success, "no_face" or message on failure.
+    Returns (encoding: np.ndarray[128] | None, method: str, error: str | None).
+
+    error is None on success. Otherwise it is one of:
+      ERR_NO_FACE            - a valid, readable image with no detectable face
+      ERR_ENGINE_UNAVAILABLE - neither cv2 nor face_recognition could be
+                                imported (a dependency/deployment problem,
+                                NOT a bad photo — must never be reported to
+                                the user as "invalid image")
+      ERR_PROCESSING         - an unexpected runtime error while encoding
+
+    Order of preference: face_recognition (dlib, high accuracy) first,
+    OpenCV Haar-cascade fallback second. A missing dependency for one
+    engine never blocks the other.
     """
-    # Try face_recognition first
-    try:
-        enc, err = _encode_face_recognition(arr)
-        if err is None:
-            return enc, "face_recognition", None
-        if err == "no_face":
-            # Try OpenCV before giving up
-            enc2, err2 = _encode_opencv(arr)
-            if err2 is None:
-                return enc2, "opencv", None
-            return None, "none", "No face detected in image."
-    except ImportError:
-        log.warning("face_recognition not available, using OpenCV fallback.")
+    if not FACE_ENGINE_AVAILABLE:
+        return None, "none", ERR_ENGINE_UNAVAILABLE
+
+    saw_no_face = False
+
+    if FACE_RECOGNITION_AVAILABLE:
+        try:
+            enc, err = _encode_face_recognition(arr)
+            if err is None:
+                return enc, "face_recognition", None
+            saw_no_face = True
+        except Exception as exc:
+            log.error("face_recognition encode error: %s", exc)
+            # fall through and still try the OpenCV path below
+
+    if CV2_AVAILABLE:
         try:
             enc, err = _encode_opencv(arr)
             if err is None:
                 return enc, "opencv", None
-            return None, "none", "No face detected in image."
+            saw_no_face = True
         except Exception as exc:
             log.error("OpenCV encode error: %s", exc)
-            return None, "none", f"Encoding error: {exc}"
-    except Exception as exc:
-        log.error("face_recognition encode error: %s", exc)
-        return None, "none", f"Encoding error: {exc}"
+
+    if saw_no_face:
+        return None, "none", ERR_NO_FACE
+    return None, "none", ERR_PROCESSING
+
+
+# Human-readable messages shown in the UI for each error code.
+ERROR_MESSAGES = {
+    ERR_NO_FACE: "No face detected in the image. Please use a clear, "
+                 "front-facing photo with good lighting.",
+    ERR_ENGINE_UNAVAILABLE: "Face detection engine unavailable on this "
+                 "server (missing dependencies: cv2/face_recognition). "
+                 "This is a deployment issue, not a problem with your "
+                 "photo — please contact the administrator.",
+    ERR_PROCESSING: "Could not process this image due to an unexpected "
+                 "error. Please try a different photo.",
+}
+
+
+def face_error_message(err_code: str) -> str:
+    return ERROR_MESSAGES.get(err_code, f"Error: {err_code}")
 
 
 def compare_encodings(stored: np.ndarray, query: np.ndarray) -> float:
@@ -262,7 +390,7 @@ def recognize_from_bytes(img_bytes: bytes):
 
     query_enc, method, err = encode_face(arr)
     if err:
-        return None, err
+        return None, face_error_message(err)
 
     db = get_db()
     students = db.execute(
@@ -304,7 +432,16 @@ def retrain_student(student_db_id: int, db) -> tuple:
     """
     Re-encode all stored images for a student.
     Returns (success: bool, trained_count: int, skipped_count: int).
+
+    IMPORTANT: if the face-detection engine itself is unavailable
+    (dependency/deployment problem), this function does NOT touch the
+    student's existing face_encodings — a temporary missing dependency
+    must never wipe out previously-trained data.
     """
+    if not FACE_ENGINE_AVAILABLE:
+        log.error("retrain_student aborted: %s", ERR_ENGINE_UNAVAILABLE)
+        return False, 0, 0
+
     images = db.execute(
         "SELECT id, image_data FROM face_images WHERE student_id=?",
         (student_db_id,)
@@ -388,8 +525,7 @@ with st.sidebar:
     <hr style='border-color:rgba(255,255,255,.15);margin:.4rem 0'>
     """, unsafe_allow_html=True)
 
-    st.markdown("<div style='font-size:.68rem;opacity:.45;text-transform:uppercase;"
-                "letter-spacing:1px;padding:.2rem .4rem'>User Panel</div>",
+    st.markdown("<div class='ptu-sidebar-heading'>👤 User Panel</div>",
                 unsafe_allow_html=True)
 
     if st.button("🏠  Home",           use_container_width=True): go("home")
@@ -398,8 +534,7 @@ with st.sidebar:
 
     st.markdown("<hr style='border-color:rgba(255,255,255,.15);margin:.4rem 0'>",
                 unsafe_allow_html=True)
-    st.markdown("<div style='font-size:.68rem;opacity:.45;text-transform:uppercase;"
-                "letter-spacing:1px;padding:.2rem .4rem'>Admin Panel</div>",
+    st.markdown("<div class='ptu-sidebar-heading'>🛡️ Admin Panel</div>",
                 unsafe_allow_html=True)
 
     if st.session_state.admin_logged_in:
@@ -439,6 +574,17 @@ with st.sidebar:
       </div>
     </div>
     """, unsafe_allow_html=True)
+
+    # ── Face-engine status badge ──────────────────────────
+    if FACE_ENGINE_AVAILABLE and FACE_RECOGNITION_AVAILABLE:
+        _eng_badge = "🟢 Engine: face_recognition (dlib)"
+    elif FACE_ENGINE_AVAILABLE:
+        _eng_badge = "🟡 Engine: OpenCV fallback only"
+    else:
+        _eng_badge = "🔴 Engine: unavailable"
+    st.markdown(
+        f"<div style='margin-top:.4rem;font-size:.68rem;text-align:center;"
+        f"opacity:.85'>{_eng_badge}</div>", unsafe_allow_html=True)
 
 page = st.session_state.page
 
@@ -547,6 +693,20 @@ elif page == "search":
 elif page == "detect":
     st.markdown("## 📷 Face Detection & Recognition")
     st.caption("Upload a photo or use camera to identify a student")
+
+    if not FACE_ENGINE_AVAILABLE:
+        st.error(
+            "🚫 **Face detection engine unavailable on this server.** "
+            "Neither `cv2` (OpenCV) nor `face_recognition` could be "
+            "imported. This is a deployment/dependency problem — "
+            "please contact the administrator.")
+        with st.expander("🔧 Technical details"):
+            st.json(face_engine_status())
+    elif not FACE_RECOGNITION_AVAILABLE:
+        st.warning(
+            "⚠️ Running in **OpenCV-only fallback mode** — recognition "
+            "accuracy is reduced because `face_recognition`/`dlib` is "
+            "not available.")
 
     tab_upload, tab_camera = st.tabs(["📁 Upload Image", "📷 Camera Capture"])
 
@@ -732,14 +892,17 @@ elif page == "dashboard":
             go("students")
     with qa3:
         if st.button("🔄 Retrain All", use_container_width=True):
-            with st.spinner("Retraining all students…"):
-                rows  = db.execute("SELECT id FROM students").fetchall()
-                count = 0
-                for r in rows:
-                    ok, _, _ = retrain_student(r["id"], db)
-                    if ok:
-                        count += 1
-            st.success(f"✅ Retrained {count} / {len(rows)} students.")
+            if not FACE_ENGINE_AVAILABLE:
+                st.error(face_error_message(ERR_ENGINE_UNAVAILABLE))
+            else:
+                with st.spinner("Retraining all students…"):
+                    rows  = db.execute("SELECT id FROM students").fetchall()
+                    count = 0
+                    for r in rows:
+                        ok, _, _ = retrain_student(r["id"], db)
+                        if ok:
+                            count += 1
+                st.success(f"✅ Retrained {count} / {len(rows)} students.")
     with qa4:
         if st.button("📷 Test Detect", use_container_width=True):
             go("detect")
@@ -761,6 +924,29 @@ elif page == "dashboard":
             c5.write(badge)
     else:
         st.info("No students added yet.")
+
+    with st.expander("🔧 System diagnostics (face detection engine)"):
+        status = face_engine_status()
+        d1, d2 = st.columns(2)
+        with d1:
+            st.write("**OpenCV (cv2)**")
+            if status["cv2_available"]:
+                st.success(f"✅ Available — v{status['cv2_version']}")
+            else:
+                st.error(f"❌ Unavailable — {status['cv2_error']}")
+        with d2:
+            st.write("**face_recognition (dlib)**")
+            if status["face_recognition_available"]:
+                st.success("✅ Available")
+            else:
+                st.error(f"❌ Unavailable — {status['face_recognition_error']}")
+        if not status["any_engine_available"]:
+            st.error(
+                "No face-detection engine is available. Check "
+                "`requirements.txt` is named exactly that (Streamlit "
+                "Cloud only auto-installs from `requirements.txt`), and "
+                "that `packages.txt` includes the system build "
+                "dependencies for dlib/OpenCV.")
 
 
 # ════════════════════════════════════════════════════════
@@ -987,9 +1173,27 @@ elif page == "train":
     # ── Upload section ───────────────────────────────────
     with col_upload:
         st.markdown("#### 📤 Upload Face Images")
-        st.info(
-            "Upload **at least 2** clear, front-facing photos. "
-            "Multiple images improve recognition accuracy.")
+
+        if not FACE_ENGINE_AVAILABLE:
+            st.error(
+                "🚫 **Face detection engine unavailable on this server.** "
+                "Neither `cv2` (OpenCV) nor `face_recognition` could be "
+                "imported. This is a deployment/dependency problem, not "
+                "an issue with your photos — uploads are disabled until "
+                "it's fixed. Contact the administrator.")
+            with st.expander("🔧 Technical details"):
+                st.json(face_engine_status())
+        else:
+            st.info(
+                "Upload **at least 2** clear, front-facing photos. "
+                "Multiple images improve recognition accuracy.")
+            if not FACE_RECOGNITION_AVAILABLE:
+                st.warning(
+                    "⚠️ Running in **OpenCV-only fallback mode** — the "
+                    "high-accuracy `face_recognition`/`dlib` engine is "
+                    "not available, so matches will be less reliable. "
+                    "See the technical note in the sidebar/deployment "
+                    "docs to enable it.")
 
         files = st.file_uploader(
             "Choose images",
@@ -1020,10 +1224,16 @@ elif page == "train":
             "🧠 Upload & Train",
             type="primary",
             use_container_width=True,
-            disabled=(not files)
+            disabled=(not files or not FACE_ENGINE_AVAILABLE)
         )
 
         if train_btn and files and not st.session_state.train_done:
+            if not FACE_ENGINE_AVAILABLE:
+                # Defensive guard — the button should already be disabled,
+                # but never let a dependency outage masquerade as "bad photos".
+                st.error(face_error_message(ERR_ENGINE_UNAVAILABLE))
+                st.stop()
+
             progress   = st.progress(0, text="Processing images…")
             total_f    = len(files)
             saved      = 0
@@ -1049,7 +1259,7 @@ elif page == "train":
 
                 enc, method, err = encode_face(arr)
                 if err:
-                    skip_msgs.append(f"⚠️ {f.name}: {err}")
+                    skip_msgs.append(f"⚠️ {f.name}: {face_error_message(err)}")
                     skipped += 1
                     continue
 
