@@ -1,0 +1,11 @@
+build-essential
+cmake
+libopenblas-dev
+liblapack-dev
+libboost-all-dev
+libx11-dev
+libgtk-3-0
+libglib2.0-0
+libsm6
+libxext6
+libxrender1

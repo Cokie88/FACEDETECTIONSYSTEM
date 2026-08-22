@@ -1,5 +1,35 @@
-flask>=2.3.0
-numpy>=1.24.0
+# ══════════════════════════════════════════════════════════
+# DEFAULT / RECOMMENDED requirements — guaranteed clean install
+# ══════════════════════════════════════════════════════════
+# This file intentionally contains ONLY pure-Python / prebuilt-wheel
+# packages. Verified in a clean environment: every package here
+# installs from a prebuilt wheel in seconds, with no C/C++ compilation
+# step at all.
+#
+# Why dlib / face-recognition are NOT in this file:
+#   dlib has no prebuilt Linux wheel on PyPI and must compile from
+#   source (10-20+ min, needs cmake/boost/openblas). Testing confirms
+#   that if that compilation fails for ANY reason (low memory, a
+#   platform quirk, a build timeout — all realistic on Streamlit
+#   Cloud's free tier), `pip install -r requirements.txt` aborts the
+#   ENTIRE install — including numpy, Pillow, and opencv-python-
+#   headless, which would otherwise have installed just fine. That
+#   would reproduce "No module named 'cv2'" even with everything else
+#   set up correctly.
+#
+# The app already runs a full face-detection & recognition pipeline
+# with OpenCV alone (Haar-cascade detection). If you want the more
+# accurate dlib-based `face_recognition` engine and are fine with a
+# slower, less-guaranteed build, use `requirements-full.txt` instead
+# (rename it to requirements.txt, or point Streamlit Cloud's advanced
+# settings at it). The app auto-detects whichever engine(s) are
+# available at runtime — no code changes needed either way.
+# ══════════════════════════════════════════════════════════
+
+streamlit>=1.32.0
+numpy>=1.24.0,<2.0.0
 Pillow>=10.0.0
-opencv-python-headless>=4.8.0
-face-recognition>=1.3.0
+
+# IMPORTANT: pin <5.0.0 — verified that opencv-python-headless 5.0.0
+# removes/breaks cv2.CascadeClassifier (AttributeError at runtime).
+opencv-python-headless>=4.8.0,<5.0.0

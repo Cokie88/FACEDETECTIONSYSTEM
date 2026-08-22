@@ -1,0 +1,36 @@
+# ══════════════════════════════════════════════════════════
+# OPTIONAL "full" requirements — adds the high-accuracy
+# dlib-based face_recognition engine on top of the default set.
+# ══════════════════════════════════════════════════════════
+# Use this INSTEAD of requirements.txt only if you specifically want
+# the more accurate face_recognition/dlib engine and accept that:
+#   - the build compiles dlib from source and can take 10-20+ minutes
+#   - it needs real memory/CPU and can fail on constrained/free tiers
+#   - packages.txt MUST include: build-essential, cmake, libopenblas-dev,
+#     liblapack-dev, libboost-all-dev (already included in this repo's
+#     packages.txt)
+#
+# To use: rename this file to requirements.txt (replacing the default),
+# or set it as the requirements file in Streamlit Cloud's advanced
+# deploy settings. Do not keep both requirements.txt and this file
+# with the same content active — Streamlit Cloud reads requirements.txt.
+#
+# The app code needs NO changes either way — it auto-detects cv2 and
+# face_recognition independently at runtime and uses whichever is
+# available (see face_engine_status() in streamlit_app.py).
+# ══════════════════════════════════════════════════════════
+
+streamlit>=1.32.0
+numpy>=1.24.0,<2.0.0
+Pillow>=10.0.0
+opencv-python-headless>=4.8.0,<5.0.0
+
+# dlib has no Linux wheel on PyPI — this line triggers a source build.
+# cmake here is a *fallback* for local/manual installs; on Streamlit
+# Cloud the system cmake from packages.txt (on PATH) is what dlib's
+# build script actually finds and uses (pip's build isolation does not
+# reliably expose a pip-installed `cmake` package to dlib's build step).
+cmake>=3.25.0
+dlib==19.24.6
+face-recognition-models==0.3.0
+face-recognition==1.3.0
